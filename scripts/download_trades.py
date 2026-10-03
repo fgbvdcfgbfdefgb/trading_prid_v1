@@ -35,6 +35,9 @@ PAIR = "XBTUSD"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_DIR = os.path.join(BASE_DIR, "data", "raw_trades")
 CHUNK_ROWS = 2_000_000
+ROTATE_SECONDS = 600   # also rotate chunks on a time basis (not just row count), so
+                       # the resampler always has a recently-closed, readable file
+                       # instead of waiting on a 2M-row threshold that may take days
 SLEEP_BETWEEN_CALLS = 2.5
 MAX_RETRIES = 8
 
@@ -121,6 +124,7 @@ def main():
         chunk_idx += 1
     rows_in_chunk = 0
     f, w = open_chunk_writer(prefix, chunk_idx, append=False)
+    last_rotate = time.time()
     t_start = time.time()
     last_report = t_start
     empty_polls = 0
@@ -172,11 +176,12 @@ def main():
 
             since_ns = last
 
-            if rows_in_chunk >= CHUNK_ROWS:
+            if rows_in_chunk >= CHUNK_ROWS or (time.time() - last_rotate) >= ROTATE_SECONDS:
                 f.close()
                 chunk_idx += 1
                 rows_in_chunk = 0
                 f, w = open_chunk_writer(prefix, chunk_idx, append=False)
+                last_rotate = time.time()
 
             save_checkpoint(args.checkpoint, {"since_ns": since_ns, "total_trades": total,
                                                "chunk_idx": chunk_idx, "rows_in_chunk": rows_in_chunk})
