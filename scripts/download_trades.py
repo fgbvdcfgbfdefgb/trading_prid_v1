@@ -33,7 +33,7 @@ PAIR = "XBTUSD"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_DIR = os.path.join(BASE_DIR, "data", "raw_trades")
 CHUNK_ROWS = 2_000_000
-SLEEP_BETWEEN_CALLS = 1.2
+SLEEP_BETWEEN_CALLS = 2.5
 MAX_RETRIES = 8
 
 os.makedirs(RAW_DIR, exist_ok=True)
