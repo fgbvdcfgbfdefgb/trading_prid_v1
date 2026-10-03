@@ -25,6 +25,8 @@ import csv
 import gzip
 import json
 import os
+import signal
+import sys
 import time
 import urllib.request
 import urllib.error
@@ -110,12 +112,33 @@ def main():
     total = ckpt["total_trades"]
     prefix = args.chunk_prefix
 
-    f, w = open_chunk_writer(prefix, chunk_idx, append=os.path.exists(chunk_path(prefix, chunk_idx)))
+    # Safety: NEVER append to an existing gzip chunk across process restarts.
+    # Appending a fresh gzip member to a file whose previous member may not
+    # have been flushed cleanly (e.g. the process was SIGKILL'd) produces a
+    # corrupted archive. Instead, if this run's target chunk file already
+    # exists, start a brand-new chunk index -- cheap (small files) and safe.
+    if os.path.exists(chunk_path(prefix, chunk_idx)):
+        chunk_idx += 1
+    rows_in_chunk = 0
+    f, w = open_chunk_writer(prefix, chunk_idx, append=False)
     t_start = time.time()
     last_report = t_start
     empty_polls = 0
 
-    print(f"[start] job={prefix} resuming from since={since_ns} total_so_far={total}", flush=True)
+    def _graceful_exit(signum, frame):
+        print(f"[signal] caught {signum}, flushing and closing cleanly...", flush=True)
+        try:
+            f.flush()
+            f.close()
+        finally:
+            save_checkpoint(args.checkpoint, {"since_ns": since_ns, "total_trades": total,
+                                               "chunk_idx": chunk_idx, "rows_in_chunk": rows_in_chunk})
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _graceful_exit)
+    signal.signal(signal.SIGINT, _graceful_exit)
+
+    print(f"[start] job={prefix} resuming from since={since_ns} total_so_far={total} (new chunk {chunk_idx})", flush=True)
 
     try:
         while True:
