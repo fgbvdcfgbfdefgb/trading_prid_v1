@@ -11,8 +11,17 @@ while true; do
 
   git add -A
   if ! git diff --cached --quiet; then
-    N_TRADES=$(python3 -c "import json;print(json.load(open('data/raw_trades/checkpoint.json'))['total_trades'])" 2>/dev/null || echo "?")
-    git commit -q -m "data: auto-sync (total trades so far: ${N_TRADES})"
+    N_TOTAL=$(python3 -c "
+import json
+n = 0
+for fn in ('data/raw_trades/checkpoint_recent.json', 'data/raw_trades/checkpoint_backfill.json'):
+    try:
+        n += json.load(open(fn))['total_trades']
+    except Exception:
+        pass
+print(n)
+" 2>/dev/null || echo "?")
+    git commit -q -m "data: auto-sync (total trades so far: ${N_TOTAL})"
     git push -q origin main 2>> data/push.log || git push -q origin master 2>> data/push.log
     echo "[$(date -u +%FT%TZ)] pushed commit, total_trades=${N_TRADES}" >> data/push.log
   fi
