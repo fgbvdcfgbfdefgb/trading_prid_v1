@@ -23,7 +23,7 @@ print(n)
 " 2>/dev/null || echo "?")
     git commit -q -m "data: auto-sync (total trades so far: ${N_TOTAL})"
     git push -q origin main 2>> data/push.log || git push -q origin master 2>> data/push.log
-    echo "[$(date -u +%FT%TZ)] pushed commit, total_trades=${N_TRADES}" >> data/push.log
+    echo "[$(date -u +%FT%TZ)] pushed commit, total_trades=${N_TOTAL}" >> data/push.log
   fi
   sleep "$INTERVAL"
 done
