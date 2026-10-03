@@ -1,0 +1,30 @@
+[cerebrium.deployment]
+name = "btc-price-predictor-ddp"
+python_version = "3.11"
+docker_base_image_url = "debian:bookworm-slim"
+disable_auth = false
+include = ["./*", "main.py", "cerebrium.toml"]
+# Keep the deployed package small: raw trade archives, checkpoints and git
+# internals don't need to ship with the training container.
+exclude = [".*", "data/raw_trades/**", "checkpoints/**", "data/*.log", "dashboard/**"]
+
+[cerebrium.hardware]
+# Free-trial accounts typically get 1 GPU (e.g. a single A10/T4). This config
+# requests 1 GPU; bump `gpu_count` only if your plan actually grants more --
+# torchrun will otherwise hang waiting for ranks that never start.
+cpu = 2
+memory = 12.0
+compute = "AMPERE_A10"
+gpu_count = 1
+region = "us-east-1"
+
+[cerebrium.scaling]
+min_replicas = 0
+max_replicas = 1
+cooldown = 30
+
+[cerebrium.dependencies.pip]
+torch = "latest"
+pandas = "latest"
+pyarrow = "latest"
+numpy = "latest"

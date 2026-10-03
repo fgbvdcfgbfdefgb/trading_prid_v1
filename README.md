@@ -27,7 +27,7 @@ always be treated as burned.
 | `training/online_trainer.py` | The live loop: simulator tick → analyser → predictor → smoothed prediction → log every single second → resolve 30-min-old predictions into (state, actual outcome) pairs → light online gradient step → checkpoint every 1800 ticks (**1 epoch = 30 simulated minutes**). |
 | `training/train_price_predictor_ddp.py` | The **heavy**, periodic, multi-GPU **distributed** (`torch.distributed` / `DistributedDataParallel`, launched via `torchrun`) retrain job over the full historical dataset. See "Why two training scripts?" below. |
 | `dashboard/` | FastAPI + WebSocket live dashboard: market price vs AI prediction chart (updates every second) + training "sliders" (epoch progress, loss, reward, replay buffer, and two **live, draggable** controls — learning rate and prediction-smoothing α — that actually feed back into the running trainer). |
-| `cerebrium/` | Deployment config + entrypoint for running the heavy DDP job on Cerebrium's GPUs. |
+| `cerebrium.toml`, `main.py` (repo root) | Deployment config + entrypoint for running the heavy DDP job on Cerebrium's GPUs. These must live at the repo root (not nested) because Cerebrium's default runtime packages the directory containing `cerebrium.toml`. |
 
 ## Why two training scripts? (online vs. distributed)
 
@@ -87,16 +87,27 @@ Once you're in, from the repo root:
 
 ```bash
 pip install cerebrium
-cerebrium login
-cerebrium deploy cerebrium/cerebrium.toml
+cerebrium login            # interactive OAuth, needs a real browser+terminal
+# or, non-interactively with a service-account token from the dashboard:
+cerebrium save-auth-config <jwt-service-account-token>
+
+cerebrium deploy            # reads ./cerebrium.toml by default
 ```
 
-`cerebrium/cerebrium.toml` requests 1 GPU (typical for a free trial) and
-`cerebrium/main.py` exposes a `train(epochs, batch_size, lr, nproc_per_node)`
-endpoint that launches `training/train_price_predictor_ddp.py` via `torchrun`
-on whatever GPU(s) your plan grants. Leave `nproc_per_node=1` unless your plan
-actually gives you more than one GPU — `torchrun` will hang waiting for ranks
-that never start otherwise.
+`cerebrium.toml` requests 1 GPU (typical for a free trial) and `main.py`
+exposes a `train(epochs, batch_size, lr, nproc_per_node)` endpoint that
+launches `training/train_price_predictor_ddp.py` via `torchrun` on whatever
+GPU(s) your plan grants, plus a `health()` endpoint that reports
+torch/CUDA visibility. Leave `nproc_per_node=1` unless your plan actually
+gives you more than one GPU — `torchrun` will hang waiting for ranks that
+never start otherwise.
+
+Note: `cerebrium login`'s OAuth flow needs an interactive terminal and a local
+callback server, so it can't be driven from a non-interactive sandbox/CI
+environment. For those, generate a **service account token** from the
+Cerebrium dashboard (Settings → Service Accounts) and use
+`cerebrium save-auth-config <token>` instead — that's what was used to deploy
+this repo's test build.
 
 ## Data notes / "sec-sec" caveat
 
