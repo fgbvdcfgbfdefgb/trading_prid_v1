@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 """
-Resumable full-history downloader for Kraken BTC/USD trade data (tick-level).
-This is the real source of "second-by-second" data: Kraken's OHLC REST endpoint
-only retains the most recent ~720 candles, but /Trades supports pagination all
-the way back to the pair's inception (2013 for XBT/USD) via the `since` cursor.
+Resumable downloader for Kraken BTC/USD trade data (tick-level = true "sec-sec" source).
 
-Design:
-  - Writes raw trades to rotating gzip CSV chunks under data/raw_trades/
-  - Keeps a checkpoint.json with the last `since` cursor + totals so the job
-    can be killed and restarted (`python3 download_trades.py`) without redoing work.
-  - Paces requests to be a polite citizen of Kraken's public API.
-  - When it catches up to "now", it switches to slow live polling so new trades
-    keep streaming in (useful for the live simulator later).
+Kraken's OHLC REST endpoint only retains the most recent ~720 candles, but
+/Trades supports pagination all the way back to the pair's inception (2013)
+via the `since` cursor, and also acts as a genuine live feed once caught up
+to "now". This single script is used for two different jobs (see scripts/
+run_recent.sh and run_backfill.sh):
+
+  - "recent" job:   since = now - LOOKBACK_DAYS, catches up fast, then keeps
+                     polling live -> feeds the real-time simulator/dashboard.
+  - "backfill" job: since = 0 (or wherever it left off), slow multi-hour crawl
+                     of full history -> feeds long-horizon model pretraining.
+
+Usage:
+  python3 download_trades.py --checkpoint data/raw_trades/checkpoint_recent.json \
+      --chunk-prefix trades_recent_ --since-days-ago 3 --poll-when-live 10
+
+  python3 download_trades.py --checkpoint data/raw_trades/checkpoint_backfill.json \
+      --chunk-prefix trades_hist_ --since 0
 """
+import argparse
 import csv
 import gzip
 import json
 import os
-import sys
 import time
 import urllib.request
 import urllib.error
@@ -25,35 +32,34 @@ import urllib.error
 PAIR = "XBTUSD"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_DIR = os.path.join(BASE_DIR, "data", "raw_trades")
-CKPT_PATH = os.path.join(BASE_DIR, "data", "raw_trades", "checkpoint.json")
-CHUNK_ROWS = 2_000_000           # rows per gz chunk file
-SLEEP_BETWEEN_CALLS = 1.2        # seconds, polite pacing for public endpoint
+CHUNK_ROWS = 2_000_000
+SLEEP_BETWEEN_CALLS = 1.2
 MAX_RETRIES = 8
 
 os.makedirs(RAW_DIR, exist_ok=True)
 
 
-def load_checkpoint():
-    if os.path.exists(CKPT_PATH):
-        with open(CKPT_PATH) as f:
+def load_checkpoint(path, default_since_ns):
+    if os.path.exists(path):
+        with open(path) as f:
             return json.load(f)
-    return {"since_ns": "0", "total_trades": 0, "chunk_idx": 0, "rows_in_chunk": 0}
+    return {"since_ns": default_since_ns, "total_trades": 0, "chunk_idx": 0, "rows_in_chunk": 0}
 
 
-def save_checkpoint(ckpt):
-    tmp = CKPT_PATH + ".tmp"
+def save_checkpoint(path, ckpt):
+    tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(ckpt, f)
-    os.replace(tmp, CKPT_PATH)
+    os.replace(tmp, path)
 
 
-def chunk_path(idx):
-    return os.path.join(RAW_DIR, f"trades_{idx:05d}.csv.gz")
+def chunk_path(prefix, idx):
+    return os.path.join(RAW_DIR, f"{prefix}{idx:05d}.csv.gz")
 
 
-def open_chunk_writer(idx, append):
+def open_chunk_writer(prefix, idx, append):
     mode = "at" if append else "wt"
-    f = gzip.open(chunk_path(idx), mode, newline="")
+    f = gzip.open(chunk_path(prefix, idx), mode, newline="")
     w = csv.writer(f)
     if not append:
         w.writerow(["price", "volume", "time", "side", "order_type", "misc", "trade_id"])
@@ -79,18 +85,37 @@ def fetch(since_ns, retries=0):
 
 
 def main():
-    ckpt = load_checkpoint()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--chunk-prefix", required=True)
+    ap.add_argument("--since", default=None, help="raw since cursor (ns) to start from if no checkpoint")
+    ap.add_argument("--since-days-ago", type=float, default=None, help="start `N` days before now if no checkpoint")
+    ap.add_argument("--poll-when-live", type=float, default=0,
+                     help="if >0, once caught up to now, keep polling live every N seconds forever")
+    ap.add_argument("--stop-when-live", action="store_true",
+                     help="exit cleanly once caught up to now (ignored if --poll-when-live set)")
+    args = ap.parse_args()
+
+    if args.since is not None:
+        default_since = args.since
+    elif args.since_days_ago is not None:
+        default_since = str(int((time.time() - args.since_days_ago * 86400) * 1e9))
+    else:
+        default_since = "0"
+
+    ckpt = load_checkpoint(args.checkpoint, default_since)
     since_ns = ckpt["since_ns"]
     chunk_idx = ckpt["chunk_idx"]
     rows_in_chunk = ckpt["rows_in_chunk"]
     total = ckpt["total_trades"]
+    prefix = args.chunk_prefix
 
-    f, w = open_chunk_writer(chunk_idx, append=os.path.exists(chunk_path(chunk_idx)))
+    f, w = open_chunk_writer(prefix, chunk_idx, append=os.path.exists(chunk_path(prefix, chunk_idx)))
     t_start = time.time()
     last_report = t_start
     empty_polls = 0
 
-    print(f"[start] resuming from since={since_ns} total_so_far={total}", flush=True)
+    print(f"[start] job={prefix} resuming from since={since_ns} total_so_far={total}", flush=True)
 
     try:
         while True:
@@ -101,15 +126,24 @@ def main():
 
             if not trades:
                 empty_polls += 1
-                sleep_s = min(30, 2 * empty_polls)
-                time.sleep(sleep_s)
                 since_ns = last
-                continue
+                save_checkpoint(args.checkpoint, {"since_ns": since_ns, "total_trades": total,
+                                                   "chunk_idx": chunk_idx, "rows_in_chunk": rows_in_chunk})
+                if args.poll_when_live > 0:
+                    print(f"[live] caught up to now, total_trades={total:,}. Polling every {args.poll_when_live}s", flush=True)
+                    time.sleep(args.poll_when_live)
+                    continue
+                elif args.stop_when_live:
+                    print(f"[done] caught up to now, total_trades={total:,}. Exiting.", flush=True)
+                    break
+                else:
+                    time.sleep(min(30, 2 * empty_polls))
+                    continue
             empty_polls = 0
 
             for t in trades:
-                price, volume, ts, side, otype, misc, trade_id = (t + [""])[:7] if len(t) < 7 else t
-                w.writerow([price, volume, ts, side, otype, misc, trade_id])
+                row = t if len(t) >= 7 else (t + [""] * (7 - len(t)))
+                w.writerow(row[:7])
                 rows_in_chunk += 1
                 total += 1
 
@@ -119,17 +153,18 @@ def main():
                 f.close()
                 chunk_idx += 1
                 rows_in_chunk = 0
-                f, w = open_chunk_writer(chunk_idx, append=False)
+                f, w = open_chunk_writer(prefix, chunk_idx, append=False)
 
-            ckpt = {"since_ns": since_ns, "total_trades": total,
-                    "chunk_idx": chunk_idx, "rows_in_chunk": rows_in_chunk}
-            save_checkpoint(ckpt)
+            save_checkpoint(args.checkpoint, {"since_ns": since_ns, "total_trades": total,
+                                               "chunk_idx": chunk_idx, "rows_in_chunk": rows_in_chunk})
 
             now = time.time()
             if now - last_report > 15:
                 last_ts = float(trades[-1][2])
                 rate = total / (now - t_start) if now > t_start else 0
-                print(f"[progress] total_trades={total:,} reached_time={time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(last_ts))} UTC rate={rate:.1f}/s chunk={chunk_idx}", flush=True)
+                print(f"[progress] job={prefix} total_trades={total:,} reached_time="
+                      f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(last_ts))} UTC "
+                      f"rate={rate:.1f}/s chunk={chunk_idx}", flush=True)
                 last_report = now
 
             time.sleep(SLEEP_BETWEEN_CALLS)

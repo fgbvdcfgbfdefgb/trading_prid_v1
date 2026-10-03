@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>BTC Price Predictor — Live Training Dashboard</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#0b0e14; color:#e6e6e6; font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin:0; padding:20px; }
+  h1 { font-size:20px; font-weight:600; margin:0 0 4px; }
+  .sub { color:#8a93a6; font-size:13px; margin-bottom:18px; }
+  .grid { display:grid; grid-template-columns: 2fr 1fr; gap:20px; }
+  .card { background:#131722; border:1px solid #232735; border-radius:10px; padding:16px; }
+  canvas { width:100% !important; height:380px !important; }
+  .metric-row { display:flex; justify-content:space-between; padding:6px 0; border-bottom:1px solid #1d2230; font-size:13px; }
+  .metric-row span:first-child { color:#8a93a6; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:20px; font-size:11px; font-weight:600; }
+  .badge.live { background:#163; color:#7f7; }
+  .badge.synth { background:#531; color:#fb7; }
+  .slider-block { margin:14px 0; }
+  .slider-block label { display:flex; justify-content:space-between; font-size:13px; margin-bottom:6px; }
+  input[type=range] { width:100%; }
+  .bar-wrap { background:#1d2230; border-radius:6px; height:10px; overflow:hidden; margin-top:4px;}
+  .bar-fill { height:100%; background:linear-gradient(90deg,#4f9bff,#7cf6c4); transition:width .3s; }
+  .legend { display:flex; gap:16px; font-size:12px; margin-bottom:6px;}
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; }
+</style>
+</head>
+<body>
+  <h1>₿ BTC/USD — Market Analyser (CPU) + Price Predictor (GPU, DDP-ready)</h1>
+  <div class="sub">Predicting 30 minutes ahead · updates every second · epoch = 30 simulated minutes · <span id="mode-badge" class="badge synth">loading…</span> · device: <span id="device">-</span></div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="legend">
+        <span><span class="dot" style="background:#4f9bff"></span>Market price</span>
+        <span><span class="dot" style="background:#ffb84f"></span>AI prediction (smoothed, for t+30min)</span>
+      </div>
+      <canvas id="chart"></canvas>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0;">Training — live</h3>
+      <div class="slider-block">
+        <label><span>Epoch progress (30-min window)</span><span id="epoch-label">epoch 0 · 0%</span></label>
+        <div class="bar-wrap"><div class="bar-fill" id="epoch-bar" style="width:0%"></div></div>
+      </div>
+      <div class="slider-block">
+        <label><span>Loss (EMA, lower=better)</span><span id="loss-label">—</span></label>
+        <div class="bar-wrap"><div class="bar-fill" id="loss-bar" style="width:0%; background:linear-gradient(90deg,#ff6b6b,#ffd166);"></div></div>
+      </div>
+      <div class="slider-block">
+        <label><span>Reward (EMA)</span><span id="reward-label">—</span></label>
+        <div class="bar-wrap"><div class="bar-fill" id="reward-bar" style="width:0%; background:linear-gradient(90deg,#06d6a0,#4f9bff);"></div></div>
+      </div>
+      <div class="slider-block">
+        <label><span>Replay buffer</span><span id="buffer-label">0</span></label>
+        <div class="bar-wrap"><div class="bar-fill" id="buffer-bar" style="width:0%"></div></div>
+      </div>
+
+      <hr style="border-color:#232735; margin:18px 0;">
+      <h3 style="margin-top:0;">Live controls</h3>
+      <div class="slider-block">
+        <label><span>Learning rate</span><span id="lr-val">1e-4</span></label>
+        <input type="range" id="lr-slider" min="-6" max="-2" step="0.05" value="-4">
+      </div>
+      <div class="slider-block">
+        <label><span>Prediction smoothing (EMA α — lower = smoother/more stable)</span><span id="alpha-val">0.05</span></label>
+        <input type="range" id="alpha-slider" min="0.01" max="0.5" step="0.01" value="0.05">
+      </div>
+
+      <div style="margin-top:18px; font-size:12px; color:#8a93a6;">
+        <div class="metric-row"><span>Market price</span><span id="price-val">—</span></div>
+        <div class="metric-row"><span>Predicted price (+30min)</span><span id="pred-val">—</span></div>
+        <div class="metric-row"><span>Raw log-return</span><span id="rawret-val">—</span></div>
+        <div class="metric-row"><span>Smoothed log-return</span><span id="smret-val">—</span></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const priceData = [];
+const predData = [];
+const MAX_POINTS = 600;
+
+const canvas = document.getElementById('chart');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.clientWidth * dpr;
+  canvas.height = canvas.clientHeight * dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener('resize', resizeCanvas);
+setTimeout(resizeCanvas, 50);
+
+function drawChart() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  if (priceData.length < 2) return;
+  const all = priceData.concat(predData).map(p => p.v).filter(v => v !== null && v !== undefined);
+  if (!all.length) return;
+  const minV = Math.min(...all), maxV = Math.max(...all);
+  const pad = (maxV - minV) * 0.1 || 1;
+  const lo = minV - pad, hi = maxV + pad;
+  const tMin = priceData[0].t, tMax = priceData[priceData.length-1].t;
+  const xOf = t => ((t - tMin) / Math.max(1,(tMax - tMin))) * (w-20) + 10;
+  const yOf = v => h - 20 - ((v - lo) / Math.max(1e-9,(hi - lo))) * (h-40);
+
+  function plot(data, color) {
+    ctx.beginPath();
+    let started = false;
+    for (const p of data) {
+      if (p.v === null || p.v === undefined) continue;
+      const x = xOf(p.t), y = yOf(p.v);
+      if (!started) { ctx.moveTo(x,y); started = true; } else { ctx.lineTo(x,y); }
+    }
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+  }
+  plot(priceData, '#4f9bff');
+  plot(predData, '#ffb84f');
+}
+
+function pushPoint(arr, t, v) {
+  arr.push({t, v});
+  if (arr.length > MAX_POINTS) arr.shift();
+}
+
+function fmt(n) {
+  if (n === null || n === undefined) return '—';
+  return Number(n).toLocaleString(undefined, {maximumFractionDigits: 2});
+}
+
+function applyState(s) {
+  const modeBadge = document.getElementById('mode-badge');
+  if (s.mode === 'historical_replay') { modeBadge.textContent = 'real Kraken data (replay)'; modeBadge.className='badge live'; }
+  else { modeBadge.textContent = 'synthetic fallback (real data still downloading)'; modeBadge.className='badge synth'; }
+  document.getElementById('device').textContent = s.device;
+
+  if (s.t) {
+    pushPoint(priceData, s.t, s.market_price);
+    pushPoint(predData, s.t, s.smoothed_pred_price);
+    drawChart();
+  }
+  document.getElementById('price-val').textContent = '$' + fmt(s.market_price);
+  document.getElementById('pred-val').textContent = s.smoothed_pred_price ? '$' + fmt(s.smoothed_pred_price) : '—';
+  document.getElementById('rawret-val').textContent = (s.raw_logret*100).toFixed(4) + '%';
+  document.getElementById('smret-val').textContent = (s.smoothed_logret*100).toFixed(4) + '%';
+
+  document.getElementById('epoch-label').textContent = `epoch ${s.epoch} · ${(s.epoch_progress*100).toFixed(1)}%`;
+  document.getElementById('epoch-bar').style.width = (s.epoch_progress*100) + '%';
+
+  const loss = s.loss_ema;
+  document.getElementById('loss-label').textContent = loss !== null && loss !== undefined ? loss.toExponential(3) : 'warming up…';
+  document.getElementById('loss-bar').style.width = loss ? Math.min(100, loss*5000) + '%' : '0%';
+
+  const reward = s.reward_ema;
+  document.getElementById('reward-label').textContent = reward !== null && reward !== undefined ? reward.toFixed(5) : 'warming up…';
+  document.getElementById('reward-bar').style.width = reward ? Math.min(100, (reward+1)*50) + '%' : '0%';
+
+  document.getElementById('buffer-label').textContent = s.buffer_size;
+  document.getElementById('buffer-bar').style.width = Math.min(100, s.buffer_size/200*100) + '%';
+}
+
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+const ws = new WebSocket(`${proto}://${location.host}/ws`);
+ws.onmessage = (ev) => applyState(JSON.parse(ev.data));
+
+function postParam(name, value) {
+  fetch('/api/param', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name, value})});
+}
+const lrSlider = document.getElementById('lr-slider');
+lrSlider.addEventListener('input', () => {
+  const lr = Math.pow(10, parseFloat(lrSlider.value));
+  document.getElementById('lr-val').textContent = lr.toExponential(2);
+  postParam('lr', lr);
+});
+const alphaSlider = document.getElementById('alpha-slider');
+alphaSlider.addEventListener('input', () => {
+  const a = parseFloat(alphaSlider.value);
+  document.getElementById('alpha-val').textContent = a.toFixed(2);
+  postParam('ema_alpha', a);
+});
+</script>
+</body>
+</html>
